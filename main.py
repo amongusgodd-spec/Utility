@@ -21,14 +21,14 @@ import discord
 from discord import app_commands
 from gtts import gTTS
 
-TOKEN = "YOUR_BOT_TOKEN"
+import os
+TOKEN = os.environ["TOKEN"]
 
-# Private channel the bot can see + send files in, used to store custom avatars
-# (Discord attachment links expire, so the bot re-fetches a fresh one as needed).
-STORAGE_CHANNEL_ID = 123456789012345678
-
-# Where submitted TikTok handles get logged.
-VERIFY_LOG_CHANNEL_ID = 123456789012345678
+# Fallback storage/verify channels, only used if an admin hasn't run /setstorage
+# or /setverify yet in a given server. 0 means "not set" — leave as 0 and just
+# use the slash commands after inviting the bot; no need to edit these.
+STORAGE_CHANNEL_ID = 0
+VERIFY_LOG_CHANNEL_ID = 0
 
 # Optional: role to hand out once someone submits the verify form. Leave as
 # None to skip auto-roling and just log the submission.
@@ -122,9 +122,11 @@ def save_id_map(path: str, data: dict) -> None:
 
 VERIFY_SUBMIT_CHANNEL_FILE = "verify_submit_channel.json"
 VERIFYUSER_LOG_CHANNEL_FILE = "verifyuser_log_channel.json"
+STORAGE_CHANNEL_FILE = "storage_channel.json"
 
 verify_submit_channel: dict[int, int] = load_id_map(VERIFY_SUBMIT_CHANNEL_FILE)  # guild_id -> channel_id
 verifyuser_log_channel: dict[int, int] = load_id_map(VERIFYUSER_LOG_CHANNEL_FILE)  # guild_id -> channel_id
+storage_channel_config: dict[int, int] = load_id_map(STORAGE_CHANNEL_FILE)  # guild_id -> channel_id
 
 
 # ================================================================== voice (TTS only)
@@ -182,8 +184,11 @@ async def get_webhook(channel: discord.TextChannel) -> discord.Webhook:
     return wh
 
 
-async def get_storage_channel() -> discord.abc.Messageable:
-    return client.get_channel(STORAGE_CHANNEL_ID) or await client.fetch_channel(STORAGE_CHANNEL_ID)
+async def get_storage_channel(guild_id: int) -> discord.abc.Messageable:
+    channel_id = storage_channel_config.get(guild_id, STORAGE_CHANNEL_ID)
+    if not channel_id:
+        raise RuntimeError("No storage channel set — an admin needs to run /setstorage first.")
+    return client.get_channel(channel_id) or await client.fetch_channel(channel_id)
 
 
 async def resolve_avatar(profile: dict, member: discord.Member) -> str:
@@ -193,7 +198,7 @@ async def resolve_avatar(profile: dict, member: discord.Member) -> str:
         if cached and time.time() - cached[1] < AVATAR_CACHE_SECONDS:
             return cached[0]
         try:
-            ch = await get_storage_channel()
+            ch = await get_storage_channel(member.guild.id)
             msg = await ch.fetch_message(msg_id)
             url = msg.attachments[0].url
             avatar_cache[msg_id] = (url, time.time())
@@ -369,11 +374,14 @@ async def profile_set(
         data["name"] = name
     if avatar:
         try:
-            ch = await get_storage_channel()
+            ch = await get_storage_channel(interaction.guild_id)
             stored = await ch.send(content=key, file=await avatar.to_file())
+        except RuntimeError as e:
+            await interaction.followup.send(str(e), ephemeral=True)
+            return
         except discord.HTTPException:
             await interaction.followup.send(
-                "I couldn't store that avatar (check STORAGE_CHANNEL_ID and my permissions).",
+                "I couldn't store that avatar — check my permissions in the storage channel.",
                 ephemeral=True,
             )
             return
@@ -683,6 +691,27 @@ async def setlog_error(interaction: discord.Interaction, error: app_commands.App
 
 
 @app_commands.command(
+    name="setstorage", description="Set the private channel used to store avatars/images"
+)
+@app_commands.describe(channel="A channel only the bot (and maybe staff) can see")
+@app_commands.checks.has_permissions(administrator=True)
+async def setstorage(interaction: discord.Interaction, channel: discord.TextChannel):
+    storage_channel_config[interaction.guild_id] = channel.id
+    save_id_map(STORAGE_CHANNEL_FILE, storage_channel_config)
+    await interaction.response.send_message(
+        f"Avatars and /imagelink uploads will now be stored in {channel.mention}.", ephemeral=True
+    )
+
+
+@setstorage.error
+async def setstorage_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("You need Administrator to do that.", ephemeral=True)
+    else:
+        print(f"/setstorage error: {error}")
+
+
+@app_commands.command(
     name="verifyrolesetup", description="Choose the role /verifyuser hands out automatically"
 )
 @app_commands.describe(role="Must be below your own top role")
@@ -958,10 +987,13 @@ async def imagelink(interaction: discord.Interaction, image: discord.Attachment)
     # Discord attachment URLs on the CDN expire; re-hosting it in a channel the
     # bot controls gives back a link that stays valid indefinitely.
     try:
-        ch = await get_storage_channel()
+        ch = await get_storage_channel(interaction.guild_id)
         data = await image.read()
         stored = await ch.send(file=discord.File(io.BytesIO(data), filename=image.filename))
         link = stored.attachments[0].url
+    except RuntimeError as e:
+        await interaction.response.send_message(str(e), ephemeral=True)
+        return
     except discord.HTTPException as e:
         await interaction.response.send_message(f"Couldn't process that image: {e}", ephemeral=True)
         return
@@ -1082,4 +1114,6 @@ client.tree.add_command(verifyuser)
 client.tree.add_command(verifyrolesetup)
 client.tree.add_command(setverify)
 client.tree.add_command(setlog)
+client.tree.add_command(setstorage)
 client.run(TOKEN)
+
