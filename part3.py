@@ -228,7 +228,7 @@ async def award_xp_on_message(message: discord.Message):
             pass
 
 
-client.add_listener(award_xp_on_message, "on_message")
+# (hooked in near the bottom of this file, chained onto the existing on_message handler)
 
 
 # ---------------------------------------------------------------- guess the number
@@ -278,7 +278,7 @@ async def guess_number_listener(message: discord.Message):
             pass
 
 
-client.add_listener(guess_number_listener, "on_message")
+# (hooked in near the bottom of this file, chained onto the existing on_message handler)
 
 
 # ---------------------------------------------------------------- hangman
@@ -357,7 +357,24 @@ async def hangman_listener(message: discord.Message):
         await message.channel.send(hangman_display(game))
 
 
-client.add_listener(hangman_listener, "on_message")
+# (hooked in near the bottom of this file, chained onto the existing on_message handler)
+
+
+# ---------------------------------------------------------------- hook into on_message safely
+# This bot's client class is a plain discord.Client (not commands.Bot), which has no
+# add_listener(). Instead, chain these three onto whatever on_message is already set to
+# (the relay/TTS/automod handler from part2.py) so nothing gets replaced or skipped.
+_prior_on_message = client.on_message
+
+
+async def _part3_on_message(message: discord.Message):
+    await _prior_on_message(message)
+    await award_xp_on_message(message)
+    await guess_number_listener(message)
+    await hangman_listener(message)
+
+
+client.on_message = _part3_on_message
 
 
 # ---------------------------------------------------------------- tic-tac-toe
