@@ -2279,3 +2279,8 @@ async def on_ready():
 async def on_message(message: discord.Message):
     if message.author.bot or message.webhook_id:
         return
+if __name__ == "__main__":
+    token = os.getenv("TOKEN")
+    if not token:
+        raise RuntimeError("TOKEN variable is missing in Railway")
+    client.run(token)
