@@ -389,12 +389,50 @@ profile_group = app_commands.Group(
     name="profile", description="Customise how your messages appear in this server", guild_only=True
 )
 
+PROFILE_SLOTS_FILE = "profile_slots.json"
+PROFILE_ACTIVE_FILE = "profile_active.json"
+MAX_PROFILE_SLOTS = 30
+
+profile_slots: dict = load_json_file(PROFILE_SLOTS_FILE, {})  # "guild:user" -> {slot_name: {name, avatar_url/avatar_msg}}
+profile_active_slot: dict = load_json_file(PROFILE_ACTIVE_FILE, {})  # "guild:user" -> slot_name currently in use
+
 
 def valid_name(name: str) -> Optional[str]:
     if not 1 <= len(name) <= 80:
         return "Name must be 1-80 characters."
     if any(bad in name.lower() for bad in ("discord", "clyde")):
         return 'Webhook names can\'t contain "discord" or "clyde".'
+    return None
+
+
+def valid_slot(slot: str) -> Optional[str]:
+    if not 1 <= len(slot) <= 32:
+        return "Profile slot names must be 1-32 characters."
+    return None
+
+
+async def build_avatar_fields(
+    interaction: discord.Interaction, key: str, data: dict, avatar: Optional[discord.Attachment], avatar_url: Optional[str]
+) -> Optional[str]:
+    """Validates + stores an avatar into `data` in place. Returns an error message, or None on success."""
+    if avatar and not (avatar.content_type or "").startswith("image/"):
+        return "That attachment isn't an image."
+    if avatar_url and not avatar_url.startswith(("http://", "https://")):
+        return "Avatar link must start with http:// or https://"
+
+    if avatar:
+        try:
+            ch = await get_storage_channel(interaction.guild_id)
+            stored = await ch.send(content=key, file=await avatar.to_file())
+        except RuntimeError as e:
+            return str(e)
+        except discord.HTTPException:
+            return "I couldn't store that avatar — check my permissions in the storage channel."
+        data["avatar_msg"] = stored.id
+        data.pop("avatar_url", None)
+    elif avatar_url:
+        data["avatar_url"] = avatar_url
+        data.pop("avatar_msg", None)
     return None
 
 
@@ -453,6 +491,139 @@ async def profile_set(
     profiles[key] = data
     save_profiles()
     await interaction.followup.send("Profile updated! Use /profile view to preview it.", ephemeral=True)
+
+
+@profile_group.command(name="create", description="Save a new named relay profile (up to 30 per person)")
+@app_commands.describe(
+    slot="A short name for this profile, e.g. 'formal' or 'gremlin mode'",
+    name="Display name for this profile",
+    avatar="Upload an avatar image",
+    avatar_url="Or a permanent image link",
+)
+async def profile_create(
+    interaction: discord.Interaction,
+    slot: str,
+    name: Optional[str] = None,
+    avatar: Optional[discord.Attachment] = None,
+    avatar_url: Optional[str] = None,
+):
+    if not (name or avatar or avatar_url):
+        await interaction.response.send_message("Give this profile a name and/or an avatar.", ephemeral=True)
+        return
+    slot_err = valid_slot(slot)
+    if slot_err:
+        await interaction.response.send_message(slot_err, ephemeral=True)
+        return
+    if name:
+        name_err = valid_name(name)
+        if name_err:
+            await interaction.response.send_message(name_err, ephemeral=True)
+            return
+
+    await interaction.response.defer(ephemeral=True)
+    key = pkey(interaction.guild_id, interaction.user.id)
+    slots = profile_slots.setdefault(key, {})
+
+    if slot not in slots and len(slots) >= MAX_PROFILE_SLOTS:
+        await interaction.followup.send(
+            f"You've hit the {MAX_PROFILE_SLOTS}-profile limit — delete one with /profile delete first.",
+            ephemeral=True,
+        )
+        return
+
+    data = dict(slots.get(slot, {}))
+    if name:
+        data["name"] = name
+    err = await build_avatar_fields(interaction, key, data, avatar, avatar_url)
+    if err:
+        await interaction.followup.send(err, ephemeral=True)
+        return
+
+    slots[slot] = data
+    save_json_file(PROFILE_SLOTS_FILE, profile_slots)
+
+    # Creating a profile makes it the active one right away.
+    profiles[key] = dict(data)
+    save_profiles()
+    profile_active_slot[key] = slot
+    save_json_file(PROFILE_ACTIVE_FILE, profile_active_slot)
+
+    await interaction.followup.send(
+        f"Saved profile **{slot}** ({len(slots)}/{MAX_PROFILE_SLOTS}) and switched to it.", ephemeral=True
+    )
+
+
+@profile_group.command(name="use", description="Switch your active relay profile to a saved one")
+@app_commands.describe(slot="Which saved profile to switch to")
+async def profile_use(interaction: discord.Interaction, slot: str):
+    key = pkey(interaction.guild_id, interaction.user.id)
+    slots = profile_slots.get(key, {})
+    if slot not in slots:
+        await interaction.response.send_message(
+            f"No saved profile called **{slot}**. Use /profile list to see what you've got.", ephemeral=True
+        )
+        return
+    profiles[key] = dict(slots[slot])
+    save_profiles()
+    profile_active_slot[key] = slot
+    save_json_file(PROFILE_ACTIVE_FILE, profile_active_slot)
+    await interaction.response.send_message(f"Switched to **{slot}**.", ephemeral=True)
+
+
+@profile_use.autocomplete("slot")
+async def profile_use_autocomplete(interaction: discord.Interaction, current: str):
+    key = pkey(interaction.guild_id, interaction.user.id)
+    slots = profile_slots.get(key, {})
+    return [
+        app_commands.Choice(name=s, value=s) for s in slots if current.lower() in s.lower()
+    ][:25]
+
+
+@profile_group.command(name="list", description="List your saved relay profiles")
+async def profile_list(interaction: discord.Interaction):
+    key = pkey(interaction.guild_id, interaction.user.id)
+    slots = profile_slots.get(key, {})
+    if not slots:
+        await interaction.response.send_message("You don't have any saved profiles yet — try /profile create.", ephemeral=True)
+        return
+    active = profile_active_slot.get(key)
+    lines = [f"{'⭐ ' if s == active else ''}**{s}** — {d.get('name', '(no name set)')}" for s, d in slots.items()]
+    await interaction.response.send_message(
+        f"**Your profiles ({len(slots)}/{MAX_PROFILE_SLOTS}):**\n" + "\n".join(lines), ephemeral=True
+    )
+
+
+@profile_group.command(name="delete", description="Delete a saved relay profile")
+@app_commands.describe(slot="Which saved profile to delete")
+async def profile_delete(interaction: discord.Interaction, slot: str):
+    key = pkey(interaction.guild_id, interaction.user.id)
+    slots = profile_slots.get(key, {})
+    if slot not in slots:
+        await interaction.response.send_message(f"No saved profile called **{slot}**.", ephemeral=True)
+        return
+    del slots[slot]
+    save_json_file(PROFILE_SLOTS_FILE, profile_slots)
+
+    if profile_active_slot.get(key) == slot:
+        profile_active_slot.pop(key, None)
+        save_json_file(PROFILE_ACTIVE_FILE, profile_active_slot)
+        profiles.pop(key, None)
+        save_profiles()
+        await interaction.response.send_message(
+            f"Deleted **{slot}** — that was your active profile, so you're back to your normal name/avatar.",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.send_message(f"Deleted **{slot}**.", ephemeral=True)
+
+
+@profile_delete.autocomplete("slot")
+async def profile_delete_autocomplete(interaction: discord.Interaction, current: str):
+    key = pkey(interaction.guild_id, interaction.user.id)
+    slots = profile_slots.get(key, {})
+    return [
+        app_commands.Choice(name=s, value=s) for s in slots if current.lower() in s.lower()
+    ][:25]
 
 
 @profile_group.command(name="view", description="Preview how your messages will look")
@@ -660,6 +831,49 @@ async def snipe(interaction: discord.Interaction):
 TIKTOK_HANDLE_RE = re.compile(r"^@?[\w.]{1,24}$")
 VERIFY_COOLDOWN_SECONDS = 300
 verify_last_submit: dict[str, float] = {}  # "guild:user" -> unix timestamp
+pending_dm_verify: dict[int, int] = {}  # user_id -> guild_id, while awaiting their DM reply
+
+VERIFY_EMOJI_PANELS_FILE = "verify_emoji_panels.json"
+verify_emoji_panels: dict = load_json_file(VERIFY_EMOJI_PANELS_FILE, {})  # "message_id" -> {"guild_id","emoji"}
+
+VERIFY_STATS_FILE = "verify_stats.json"
+verify_stats: dict = load_json_file(VERIFY_STATS_FILE, {})  # "guild_id" -> {"approved": n, "denied": n}
+
+
+async def submit_tiktok_verification(guild_id: int, user: discord.abc.User, raw_handle: str) -> str:
+    """Shared by the button's modal and the emoji-reaction DM flow. Returns the
+    message to show/send back to the user."""
+    cd_key = pkey(guild_id, user.id)
+    last = verify_last_submit.get(cd_key, 0)
+    remaining = VERIFY_COOLDOWN_SECONDS - (time.time() - last)
+    if remaining > 0:
+        return f"You can resubmit in {int(remaining // 60) + 1} minute(s)."
+
+    handle = raw_handle.strip()
+    if not TIKTOK_HANDLE_RE.match(handle):
+        return "That doesn't look like a valid TikTok username. Try again, e.g. `@yourname`."
+
+    review_channel_id = verify_submit_channel.get(guild_id, VERIFY_LOG_CHANNEL_ID)
+    if not review_channel_id:
+        return "Verification isn't fully set up yet — ask an admin to run /setverify."
+    try:
+        review_channel = client.get_channel(review_channel_id) or await client.fetch_channel(review_channel_id)
+    except discord.HTTPException:
+        return "The configured verify channel couldn't be found — ask an admin to run /setverify again."
+
+    normalized = handle if handle.startswith("@") else f"@{handle}"
+    embed = discord.Embed(title="Verification pending review", color=discord.Color.gold())
+    embed.add_field(name="Member", value=f"{user.mention} ({user})", inline=False)
+    embed.add_field(name="TikTok", value=f"[{normalized}](https://tiktok.com/{normalized})", inline=False)
+    embed.timestamp = discord.utils.utcnow()
+    embed.set_thumbnail(url=user.display_avatar.url)
+    # Machine-readable record, parsed back out by the Approve/Deny buttons —
+    # keeps this stateless so the buttons survive a bot restart.
+    embed.set_footer(text=f"verify|{guild_id}|{user.id}|{normalized}")
+
+    await review_channel.send(embed=embed, view=VerifyReviewView())
+    verify_last_submit[cd_key] = time.time()
+    return "Thanks! Your submission has been sent to the mods for review."
 
 
 class TikTokModal(discord.ui.Modal, title="Verify with TikTok"):
@@ -672,55 +886,8 @@ class TikTokModal(discord.ui.Modal, title="Verify with TikTok"):
     )
 
     async def on_submit(self, interaction: discord.Interaction):
-        cd_key = pkey(interaction.guild_id, interaction.user.id)
-        last = verify_last_submit.get(cd_key, 0)
-        remaining = VERIFY_COOLDOWN_SECONDS - (time.time() - last)
-        if remaining > 0:
-            await interaction.response.send_message(
-                f"You can resubmit in {int(remaining // 60) + 1} minute(s).", ephemeral=True
-            )
-            return
-
-        handle = self.tiktok.value.strip()
-        if not TIKTOK_HANDLE_RE.match(handle):
-            await interaction.response.send_message(
-                "That doesn't look like a valid TikTok username. Try again, e.g. `@yourname`.",
-                ephemeral=True,
-            )
-            return
-
-        review_channel_id = verify_submit_channel.get(interaction.guild_id, VERIFY_LOG_CHANNEL_ID)
-        if not review_channel_id:
-            await interaction.response.send_message(
-                "Verification isn't fully set up yet — ask an admin to run /setverify.", ephemeral=True
-            )
-            return
-        try:
-            review_channel = client.get_channel(review_channel_id) or await client.fetch_channel(
-                review_channel_id
-            )
-        except discord.HTTPException:
-            await interaction.response.send_message(
-                "The configured verify channel couldn't be found — ask an admin to run /setverify again.",
-                ephemeral=True,
-            )
-            return
-
-        normalized = handle if handle.startswith("@") else f"@{handle}"
-        embed = discord.Embed(title="Verification pending review", color=discord.Color.gold())
-        embed.add_field(name="Member", value=f"{interaction.user.mention} ({interaction.user})", inline=False)
-        embed.add_field(name="TikTok", value=f"[{normalized}](https://tiktok.com/{normalized})", inline=False)
-        embed.timestamp = discord.utils.utcnow()
-        embed.set_thumbnail(url=interaction.user.display_avatar.url)
-        # Machine-readable record, parsed back out by the Approve/Deny buttons —
-        # keeps this stateless so the buttons survive a bot restart.
-        embed.set_footer(text=f"verify|{interaction.guild_id}|{interaction.user.id}|{normalized}")
-
-        await review_channel.send(embed=embed, view=VerifyReviewView())
-        verify_last_submit[cd_key] = time.time()
-        await interaction.response.send_message(
-            "Thanks! Your submission has been sent to the mods for review.", ephemeral=True
-        )
+        result = await submit_tiktok_verification(interaction.guild_id, interaction.user, self.tiktok.value)
+        await interaction.response.send_message(result, ephemeral=True)
 
 
 class VerifyView(discord.ui.View):
@@ -790,6 +957,10 @@ class VerifyReviewView(discord.ui.View):
                 except discord.Forbidden:
                     pass
 
+        stats = verify_stats.setdefault(str(guild_id), {"approved": 0, "denied": 0})
+        stats["approved"] += 1
+        save_json_file(VERIFY_STATS_FILE, verify_stats)
+
         await self._finish(interaction, True, discord.Color.green(), f"✅ Approved by {interaction.user.mention}")
 
     @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger, custom_id="verify_review:deny")
@@ -798,9 +969,15 @@ class VerifyReviewView(discord.ui.View):
             await interaction.response.send_message("You need Manage Messages to do that.", ephemeral=True)
             return
 
-        if not self._parse(interaction.message):
+        parsed = self._parse(interaction.message)
+        if not parsed:
             await interaction.response.send_message("Couldn't read this submission.", ephemeral=True)
             return
+        guild_id, _, _ = parsed
+
+        stats = verify_stats.setdefault(str(guild_id), {"approved": 0, "denied": 0})
+        stats["denied"] += 1
+        save_json_file(VERIFY_STATS_FILE, verify_stats)
 
         await self._finish(interaction, False, discord.Color.red(), f"❌ Denied by {interaction.user.mention}")
 
@@ -827,11 +1004,12 @@ BUTTON_STYLES = {
 @app_commands.describe(
     title="Panel title",
     description="Panel body text",
-    button_label="Text shown on the verify button",
-    button_style="Color of the verify button",
+    button_label="Text shown on the verify button (ignored if trigger_emoji is set)",
+    button_style="Color of the verify button (ignored if trigger_emoji is set)",
     color="Hex color for the panel, e.g. #57F287",
     banner_url="A wide image shown at the bottom of the panel",
     thumbnail_url="A small image shown in the top-right corner of the panel",
+    trigger_emoji="Use an emoji reaction instead of a button — a normal emoji or a server emoji like :name:",
 )
 @app_commands.choices(
     button_style=[
@@ -851,6 +1029,7 @@ async def verifypanel(
     color: Optional[str] = None,
     banner_url: Optional[str] = None,
     thumbnail_url: Optional[str] = None,
+    trigger_emoji: Optional[str] = None,
 ):
     embed_color = discord.Color.green()
     if color:
@@ -867,16 +1046,40 @@ async def verifypanel(
             await interaction.response.send_message(f"`{label}` must be a link starting with http(s)://", ephemeral=True)
             return
 
+    parsed_emoji = None
+    if trigger_emoji:
+        try:
+            parsed_emoji = discord.PartialEmoji.from_str(trigger_emoji.strip())
+        except Exception:
+            await interaction.response.send_message("That doesn't look like a valid emoji.", ephemeral=True)
+            return
+
     embed = discord.Embed(title=title, description=description, color=embed_color)
     if banner_url:
         embed.set_image(url=banner_url)
     if thumbnail_url:
         embed.set_thumbnail(url=thumbnail_url)
 
-    view = VerifyView()
-    view.children[0].label = button_label  # customise just this panel's button text
-    view.children[0].style = BUTTON_STYLES[button_style.value] if button_style else discord.ButtonStyle.success
-    await interaction.channel.send(embed=embed, view=view)
+    if parsed_emoji:
+        embed.set_footer(text=f"React with {parsed_emoji} below to start — I'll DM you to collect your TikTok username.")
+        msg = await interaction.channel.send(embed=embed)
+        try:
+            await msg.add_reaction(parsed_emoji)
+        except discord.HTTPException:
+            await interaction.response.send_message(
+                "Posted the panel, but I couldn't add that reaction myself — "
+                "make sure it's an emoji from this server, or add it manually.",
+                ephemeral=True,
+            )
+            return
+        verify_emoji_panels[str(msg.id)] = {"guild_id": interaction.guild_id, "emoji": str(parsed_emoji)}
+        save_json_file(VERIFY_EMOJI_PANELS_FILE, verify_emoji_panels)
+    else:
+        view = VerifyView()
+        view.children[0].label = button_label  # customise just this panel's button text
+        view.children[0].style = BUTTON_STYLES[button_style.value] if button_style else discord.ButtonStyle.success
+        await interaction.channel.send(embed=embed, view=view)
+
     await interaction.response.send_message("Verify panel posted.", ephemeral=True)
 
 
@@ -933,6 +1136,60 @@ async def verify_list(interaction: discord.Interaction):
         return
     lines = [f"[{m.embeds[0].fields[0].value}]({m.jump_url})" for m in pending[:15]]
     await interaction.followup.send(f"**Pending ({len(pending)}):**\n" + "\n".join(lines), ephemeral=True)
+
+
+@verify_group.command(name="stats", description="Show verification counts for this server")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def verify_stats_cmd(interaction: discord.Interaction):
+    channel_id = verify_submit_channel.get(interaction.guild_id, VERIFY_LOG_CHANNEL_ID)
+    await interaction.response.defer(ephemeral=True)
+
+    stats = verify_stats.get(str(interaction.guild_id), {"approved": 0, "denied": 0})
+    total_records = sum(1 for k in verified if k.startswith(f"{interaction.guild_id}:"))
+
+    pending_count = 0
+    if channel_id:
+        try:
+            channel = client.get_channel(channel_id) or await client.fetch_channel(channel_id)
+            async for msg in channel.history(limit=100):
+                if not msg.embeds or not msg.embeds[0].footer or not msg.embeds[0].footer.text:
+                    continue
+                if not msg.embeds[0].footer.text.startswith("verify|"):
+                    continue
+                if not any(f.name == "Status" for f in msg.embeds[0].fields):
+                    pending_count += 1
+        except discord.HTTPException:
+            pass
+
+    embed = discord.Embed(title="Verification stats", color=discord.Color.blurple())
+    embed.add_field(name="Approved (all time)", value=str(stats.get("approved", 0)))
+    embed.add_field(name="Denied (all time)", value=str(stats.get("denied", 0)))
+    embed.add_field(name="Currently pending", value=str(pending_count))
+    embed.add_field(name="Verified records on file", value=str(total_records), inline=False)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@verify_group.command(name="export", description="Export all verified TikTok records for this server as a file")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def verify_export(interaction: discord.Interaction):
+    prefix = f"{interaction.guild_id}:"
+    rows = [
+        f"{user_id}\t{data['tiktok']}\t{data['verified_at']}"
+        for key, data in verified.items()
+        if key.startswith(prefix)
+        for user_id in [key.split(":", 1)[1]]
+    ]
+    if not rows:
+        await interaction.response.send_message("No verified records to export.", ephemeral=True)
+        return
+
+    content = "user_id\ttiktok\tverified_at\n" + "\n".join(rows)
+    buffer = io.BytesIO(content.encode("utf-8"))
+    await interaction.response.send_message(
+        f"{len(rows)} record(s).",
+        file=discord.File(buffer, filename=f"verified_{interaction.guild_id}.tsv"),
+        ephemeral=True,
+    )
 
 
 @verify_group.error
@@ -1104,11 +1361,111 @@ async def starboard_cmd_error(interaction: discord.Interaction, error: app_comma
         print(f"/starboard error: {error}")
 
 
-@client.tree.command(name="welcomemsg", description="Set the message posted when someone joins")
-@app_commands.describe(channel="Where to post it", message="Use {user} and {server} as placeholders")
+def build_join_leave_config(
+    channel: discord.TextChannel,
+    message: str,
+    title: Optional[str],
+    color: Optional[str],
+    banner_url: Optional[str],
+    thumbnail_url: Optional[str],
+    use_embed: bool,
+    dm_instead: bool,
+    mention_user: bool,
+) -> dict:
+    return {
+        "channel_id": channel.id,
+        "message": message,
+        "title": title,
+        "color": color,
+        "banner_url": banner_url,
+        "thumbnail_url": thumbnail_url,
+        "use_embed": use_embed,
+        "dm_instead": dm_instead,
+        "mention_user": mention_user,
+    }
+
+
+async def validate_join_leave_inputs(
+    interaction: discord.Interaction, color: Optional[str], banner_url: Optional[str], thumbnail_url: Optional[str]
+) -> bool:
+    if color and not parse_hex_color(color):
+        await interaction.response.send_message(
+            "That doesn't look like a valid hex color. Try something like `#57F287`.", ephemeral=True
+        )
+        return False
+    for label, url in (("banner_url", banner_url), ("thumbnail_url", thumbnail_url)):
+        if url and not url.startswith(("http://", "https://")):
+            await interaction.response.send_message(f"`{label}` must be a link starting with http(s)://", ephemeral=True)
+            return False
+    return True
+
+
+async def send_join_leave_message(member: discord.Member, config: dict) -> None:
+    text = (
+        config["message"]
+        .replace("{user}", member.mention)
+        .replace("{username}", str(member))
+        .replace("{server}", member.guild.name)
+        .replace("{membercount}", str(member.guild.member_count))
+    )
+    content = member.mention if (config.get("mention_user") and not config.get("use_embed")) else None
+
+    if config.get("use_embed", True):
+        color = parse_hex_color(config["color"]) if config.get("color") else discord.Color.blurple()
+        embed = discord.Embed(title=config.get("title") or None, description=text, color=color or discord.Color.blurple())
+        if config.get("banner_url"):
+            embed.set_image(url=config["banner_url"])
+        if config.get("thumbnail_url"):
+            embed.set_thumbnail(url=config["thumbnail_url"])
+        elif not config.get("banner_url"):
+            embed.set_thumbnail(url=member.display_avatar.url)
+        send_kwargs = {"embed": embed}
+        if config.get("mention_user"):
+            send_kwargs["content"] = member.mention
+    else:
+        send_kwargs = {"content": (f"{member.mention} " if config.get("mention_user") else "") + text}
+
+    try:
+        if config.get("dm_instead"):
+            await member.send(**send_kwargs)
+        else:
+            channel = member.guild.get_channel(config["channel_id"])
+            if channel:
+                await channel.send(**send_kwargs)
+    except discord.HTTPException:
+        pass
+
+
+@client.tree.command(name="welcomemsg", description="Set a fully customisable message for when someone joins")
+@app_commands.describe(
+    channel="Where to post it (ignored if dm_instead is on)",
+    message="Use {user}, {username}, {server}, {membercount} as placeholders",
+    title="Embed title (ignored if use_embed is off)",
+    color="Hex color for the embed, e.g. #57F287",
+    banner_url="A wide image shown at the bottom",
+    thumbnail_url="A small corner image (defaults to the new member's avatar)",
+    use_embed="Post as a styled embed instead of plain text (default: yes)",
+    dm_instead="DM the message to the new member instead of posting in a channel",
+    mention_user="Ping the member alongside the message",
+)
 @app_commands.checks.has_permissions(administrator=True)
-async def welcomemsg(interaction: discord.Interaction, channel: discord.TextChannel, message: str):
-    welcome_config[str(interaction.guild_id)] = {"channel_id": channel.id, "message": message}
+async def welcomemsg(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    message: str,
+    title: Optional[str] = None,
+    color: Optional[str] = None,
+    banner_url: Optional[str] = None,
+    thumbnail_url: Optional[str] = None,
+    use_embed: bool = True,
+    dm_instead: bool = False,
+    mention_user: bool = True,
+):
+    if not await validate_join_leave_inputs(interaction, color, banner_url, thumbnail_url):
+        return
+    welcome_config[str(interaction.guild_id)] = build_join_leave_config(
+        channel, message, title, color, banner_url, thumbnail_url, use_embed, dm_instead, mention_user
+    )
     save_json_file(WELCOME_FILE, welcome_config)
     await interaction.response.send_message("Welcome message set.", ephemeral=True)
 
@@ -1121,11 +1478,33 @@ async def welcomemsg_error(interaction: discord.Interaction, error: app_commands
         print(f"/welcomemsg error: {error}")
 
 
-@client.tree.command(name="leavemsg", description="Set the message posted when someone leaves")
-@app_commands.describe(channel="Where to post it", message="Use {user} and {server} as placeholders")
+@client.tree.command(name="leavemsg", description="Set a fully customisable message for when someone leaves")
+@app_commands.describe(
+    channel="Where to post it",
+    message="Use {user}, {username}, {server}, {membercount} as placeholders",
+    title="Embed title (ignored if use_embed is off)",
+    color="Hex color for the embed, e.g. #ED4245",
+    banner_url="A wide image shown at the bottom",
+    thumbnail_url="A small corner image",
+    use_embed="Post as a styled embed instead of plain text (default: yes)",
+)
 @app_commands.checks.has_permissions(administrator=True)
-async def leavemsg(interaction: discord.Interaction, channel: discord.TextChannel, message: str):
-    leavemsg_config[str(interaction.guild_id)] = {"channel_id": channel.id, "message": message}
+async def leavemsg(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    message: str,
+    title: Optional[str] = None,
+    color: Optional[str] = None,
+    banner_url: Optional[str] = None,
+    thumbnail_url: Optional[str] = None,
+    use_embed: bool = True,
+):
+    if not await validate_join_leave_inputs(interaction, color, banner_url, thumbnail_url):
+        return
+    # Leave messages can't DM (the member is already gone) or @mention (same reason).
+    leavemsg_config[str(interaction.guild_id)] = build_join_leave_config(
+        channel, message, title, color, banner_url, thumbnail_url, use_embed, False, False
+    )
     save_json_file(LEAVEMSG_FILE, leavemsg_config)
     await interaction.response.send_message("Leave message set.", ephemeral=True)
 
@@ -1719,9 +2098,13 @@ async def help_cmd(interaction: discord.Interaction, category: Optional[app_comm
         "profile": (
             "Profile",
             "This server shows your relayed messages under a name/avatar you can customise.\n"
-            "`/profile set` — set a custom display name and/or avatar (upload an image or paste a link)\n"
+            "`/profile set` — quickly change your active name/avatar without saving it as a slot\n"
+            "`/profile create` — save a new named profile (up to 30 per person) and switch to it\n"
+            "`/profile use` — switch your active profile to one you've already saved\n"
+            "`/profile list` — see all your saved profiles (⭐ marks the active one)\n"
+            "`/profile delete` — remove a saved profile\n"
             "`/profile view` — preview how your messages currently look\n"
-            "`/profile random` — switch to a random preset look, if any are set up\n"
+            "`/profile random` — switch to a random preset look, if an admin has set any up\n"
             "`/profile reset` — go back to your normal Discord name and avatar",
         ),
         "voice": (
@@ -1754,6 +2137,10 @@ async def help_cmd(interaction: discord.Interaction, category: Optional[app_comm
             "`/setlog` *(admin)* — set the channel `/verifyuser` usage gets logged to\n"
             "`/unverify` *(admin)* — remove someone's verified record and role\n"
             "`/verify list` *(mods)* — show submissions still waiting for Approve/Deny\n"
+            "`/verify stats` *(mods)* — approved/denied/pending counts for this server\n"
+            "`/verify export` *(mods)* — download all verified TikTok records as a file\n"
+            "`/verifypanel` can use an emoji (including server emojis) instead of a button — react to "
+            "start, then reply to the bot's DM with your TikTok username\n"
             "There's a 5-minute cooldown on resubmitting the TikTok form.",
         ),
         "moderation": (
@@ -1787,7 +2174,8 @@ async def help_cmd(interaction: discord.Interaction, category: Optional[app_comm
             "`/suggest` — submit a suggestion (needs `/setsuggestions` set up first)\n"
             "`/setsuggestions` *(admin)* — set where suggestions get posted\n"
             "`/starboard` *(admin)* — repost ⭐-reacted messages to a channel once they hit a threshold\n"
-            "`/welcomemsg` / `/leavemsg` *(admin)* — messages posted when someone joins/leaves\n"
+            "`/welcomemsg` / `/leavemsg` *(admin)* — customisable join/leave messages: embed or plain text, "
+            "title, color, banner/thumbnail images, mention toggle, and (join only) DM-instead-of-channel\n"
             "`/8ball`, `/coinflip`, `/roll` — just for fun",
         ),
     }
@@ -1811,7 +2199,10 @@ async def commands_cmd(interaction: discord.Interaction):
     embed = discord.Embed(title="All commands", color=discord.Color.blurple())
     embed.add_field(
         name="Profile",
-        value="`/profile set` `/profile view` `/profile random` `/profile reset`",
+        value=(
+            "`/profile set` `/profile create` `/profile use` `/profile list` `/profile delete` "
+            "`/profile view` `/profile random` `/profile reset`"
+        ),
         inline=False,
     )
     embed.add_field(
@@ -1827,8 +2218,8 @@ async def commands_cmd(interaction: discord.Interaction):
     embed.add_field(
         name="Verification",
         value=(
-            "`/verifypanel` `/verify lookup` `/verify list` `/verifyuser` `/verifyrolesetup` "
-            "`/setverify` `/setlog` `/unverify`  —  plus Approve/Deny buttons"
+            "`/verifypanel` `/verify lookup` `/verify list` `/verify stats` `/verify export` `/verifyuser` "
+            "`/verifyrolesetup` `/setverify` `/setlog` `/unverify`  —  plus Approve/Deny buttons"
         ),
         inline=False,
     )
@@ -1886,217 +2277,4 @@ async def on_ready():
 
 @client.event
 async def on_message(message: discord.Message):
-    if message.author.bot or message.webhook_id or not message.guild:
-        return
-
-    # AFK: clear the sender's own status if they talk again
-    own_key = pkey(message.guild.id, message.author.id)
-    if own_key in afk_users:
-        del afk_users[own_key]
-        try:
-            await message.channel.send(
-                f"Welcome back {message.author.mention}, I've removed your AFK status.", delete_after=5
-            )
-        except discord.HTTPException:
-            pass
-
-    # AFK: let the sender know if anyone they @mentioned is away
-    if message.mentions:
-        notes = []
-        for mentioned in message.mentions:
-            m_key = pkey(message.guild.id, mentioned.id)
-            if m_key in afk_users:
-                notes.append(f"{mentioned.display_name} is AFK: {afk_users[m_key]['note']}")
-        if notes:
-            try:
-                await message.channel.send("\n".join(notes), delete_after=8)
-            except discord.HTTPException:
-                pass
-
-    # Branch 1: a voice channel's built-in text chat with TTS switched on
-    if isinstance(message.channel, discord.VoiceChannel):
-        if message.channel.id not in tts_channels or not message.content:
-            return
-        if not message.author.voice or message.author.voice.channel.id != message.channel.id:
-            return
-        if message.content.lstrip().startswith("-"):
-            return  # "-" prefix: send the message but don't speak it
-
-        voice_client = voice_clients.get(message.guild.id)
-        if not voice_client or not voice_client.is_connected():
-            return
-
-        maxlen = tts_maxlen.get(str(message.guild.id), 200)
-        text = message.content[:maxlen]
-        lang = mytts_lang.get(pkey(message.guild.id, message.author.id)) or tts_lang.get(message.guild.id, "en")
-        loop = asyncio.get_running_loop()
-
-        def make_mp3():
-            path = f"/tmp/tts_{message.id}.mp3"
-            gTTS(text=text, lang=lang).save(path)
-            return path
-
-        try:
-            path = await loop.run_in_executor(None, make_mp3)
-        except Exception as e:
-            print(f"TTS generation failed: {e}")
-            return
-
-        while voice_client.is_playing():
-            await asyncio.sleep(0.5)
-        voice_client.play(discord.FFmpegPCMAudio(path))
-        return
-
-    # Branch 2: a normal text channel/thread -> automod, then proxy through the webhook
-    if message.type not in (discord.MessageType.default, discord.MessageType.reply):
-        return
-
-    guild_key = str(message.guild.id)
-    content_lower = message.content.lower()
-
-    if blockinvites.get(guild_key) and INVITE_RE.search(message.content):
-        try:
-            await message.delete()
-            notice = await message.channel.send(f"{message.author.mention} invite links aren't allowed here.", delete_after=6)
-        except discord.HTTPException:
-            pass
-        return
-
-    for word in blockwords.get(guild_key, []):
-        if word in content_lower:
-            try:
-                await message.delete()
-                await message.channel.send(f"{message.author.mention} that message contained a blocked word.", delete_after=6)
-            except discord.HTTPException:
-                pass
-            return
-
-    blocked_channels = relay_blocklist.get(guild_key, [])
-    base_channel_id = message.channel.parent.id if isinstance(message.channel, discord.Thread) else message.channel.id
-    if base_channel_id in blocked_channels:
-        return  # relay disabled in this channel; leave the message as-is
-
-    await proxy_message(message)
-
-
-@client.event
-async def on_member_join(member: discord.Member):
-    config = welcome_config.get(str(member.guild.id))
-    if not config:
-        return
-    channel = member.guild.get_channel(config["channel_id"])
-    if not channel:
-        return
-    text = config["message"].replace("{user}", member.mention).replace("{server}", member.guild.name)
-    try:
-        await channel.send(text)
-    except discord.HTTPException:
-        pass
-
-
-@client.event
-async def on_member_remove(member: discord.Member):
-    config = leavemsg_config.get(str(member.guild.id))
-    if not config:
-        return
-    channel = member.guild.get_channel(config["channel_id"])
-    if not channel:
-        return
-    text = config["message"].replace("{user}", str(member)).replace("{server}", member.guild.name)
-    try:
-        await channel.send(text)
-    except discord.HTTPException:
-        pass
-
-
-@client.event
-async def on_member_update(before: discord.Member, after: discord.Member):
-    config = role_announce_config.get(after.guild.id)
-    if not config:
-        return
-
-    added_role_ids = {r.id for r in after.roles} - {r.id for r in before.roles}
-    if config["role_id"] not in added_role_ids:
-        return
-
-    channel = after.guild.get_channel(config["channel_id"])
-    if not channel:
-        return
-
-    role = after.guild.get_role(config["role_id"])
-    text = (
-        config["message"]
-        .replace("{user}", after.mention)
-        .replace("{role}", role.mention if role else "that role")
-        .replace("{server}", after.guild.name)
-    )
-    try:
-        await channel.send(text)
-    except discord.HTTPException:
-        pass
-
-
-@client.event
-async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
-    if payload.member is None or payload.member.bot:
-        return
-
-    if str(payload.emoji) == "⭐":
-        config = starboard_config.get(str(payload.guild_id))
-        if config and payload.message_id not in starboard_posted:
-            try:
-                channel = client.get_channel(payload.channel_id) or await client.fetch_channel(payload.channel_id)
-                msg = await channel.fetch_message(payload.message_id)
-                star_reaction = discord.utils.get(msg.reactions, emoji="⭐")
-                count = star_reaction.count if star_reaction else 0
-                if count >= config["threshold"]:
-                    board = client.get_channel(config["channel_id"]) or await client.fetch_channel(config["channel_id"])
-                    embed = discord.Embed(description=msg.content or "*attachment*", color=discord.Color.gold())
-                    embed.set_author(name=str(msg.author), icon_url=msg.author.display_avatar.url)
-                    embed.add_field(name="Source", value=f"[Jump to message]({msg.jump_url})", inline=False)
-                    if msg.attachments:
-                        embed.set_image(url=msg.attachments[0].url)
-                    posted = await board.send(content=f"⭐ {count}", embed=embed)
-                    starboard_posted[payload.message_id] = posted.id
-            except discord.HTTPException:
-                pass
-        return
-
-    if str(payload.emoji) not in CANCEL_EMOJIS:
-        return
-
-    author_id = relay_authors.get(payload.message_id)
-    if author_id is None:
-        return  # not a relayed message we're tracking (or already handled)
-
-    # Only the original sender, or someone who can manage messages, may delete it.
-    if payload.user_id != author_id and not payload.member.guild_permissions.manage_messages:
-        return
-
-    content_record = relay_content.pop(payload.message_id, None)
-    if content_record:
-        last_snipe[payload.channel_id] = {
-            "author_id": content_record["author_id"],
-            "content": content_record["content"],
-            "deleted_at": discord.utils.utcnow(),
-        }
-
-    try:
-        channel = client.get_channel(payload.channel_id) or await client.fetch_channel(payload.channel_id)
-        msg = await channel.fetch_message(payload.message_id)
-        await msg.delete()
-    except discord.HTTPException:
-        pass
-    relay_authors.pop(payload.message_id, None)
-
-
-client.tree.add_command(verifypanel)
-client.tree.add_command(imagelink)
-client.tree.add_command(unverify)
-client.tree.add_command(verifyuser)
-client.tree.add_command(verifyrolesetup)
-client.tree.add_command(setverify)
-client.tree.add_command(setlog)
-client.tree.add_command(setstorage)
-client.tree.add_command(setsuggestions)
-client.run(TOKEN)
+    if message.author.bot or message.webhook_id
