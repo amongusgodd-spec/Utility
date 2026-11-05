@@ -1,84 +1,5 @@
 
 
-@blockword_group.command(name="list", description="List blocked words/phrases")
-async def blockword_list(interaction: discord.Interaction):
-    words = blockwords.get(str(interaction.guild_id), [])
-    if not words:
-        await interaction.response.send_message("No words are blocked.", ephemeral=True)
-        return
-    await interaction.response.send_message("Blocked: " + ", ".join(f"`{w}`" for w in words), ephemeral=True)
-
-
-@client.tree.command(name="blockinvites", description="Toggle auto-deleting Discord invite links")
-@app_commands.checks.has_permissions(manage_messages=True)
-async def blockinvites_cmd(interaction: discord.Interaction):
-    key = str(interaction.guild_id)
-    blockinvites[key] = not blockinvites.get(key, False)
-    save_json_file(BLOCKINVITES_FILE, blockinvites)
-    await interaction.response.send_message(
-        "Invite links will now be auto-deleted." if blockinvites[key] else "Invite link filtering turned off.",
-        ephemeral=True,
-    )
-
-
-@client.tree.command(name="starboard", description="Set up the starboard: ⭐-reacted messages get reposted here")
-@app_commands.describe(channel="Where starred messages get reposted", threshold="How many ⭐ reactions needed")
-@app_commands.checks.has_permissions(administrator=True)
-async def starboard_cmd(interaction: discord.Interaction, channel: discord.TextChannel, threshold: app_commands.Range[int, 1, 50] = 3):
-    starboard_config[str(interaction.guild_id)] = {"channel_id": channel.id, "threshold": threshold}
-    save_json_file(STARBOARD_FILE, starboard_config)
-    await interaction.response.send_message(
-        f"Messages with {threshold}+ ⭐ will now be posted to {channel.mention}.", ephemeral=True
-    )
-
-
-@starboard_cmd.error
-async def starboard_cmd_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("You need Administrator to do that.", ephemeral=True)
-    else:
-        print(f"/starboard error: {error}")
-
-
-def build_join_leave_config(
-    channel: discord.TextChannel,
-    message: str,
-    title: Optional[str],
-    color: Optional[str],
-    banner_url: Optional[str],
-    thumbnail_url: Optional[str],
-    use_embed: bool,
-    dm_instead: bool,
-    mention_user: bool,
-) -> dict:
-    return {
-        "channel_id": channel.id,
-        "message": message,
-        "title": title,
-        "color": color,
-        "banner_url": banner_url,
-        "thumbnail_url": thumbnail_url,
-        "use_embed": use_embed,
-        "dm_instead": dm_instead,
-        "mention_user": mention_user,
-    }
-
-
-async def validate_join_leave_inputs(
-    interaction: discord.Interaction, color: Optional[str], banner_url: Optional[str], thumbnail_url: Optional[str]
-) -> bool:
-    if color and not parse_hex_color(color):
-        await interaction.response.send_message(
-            "That doesn't look like a valid hex color. Try something like `#57F287`.", ephemeral=True
-        )
-        return False
-    for label, url in (("banner_url", banner_url), ("thumbnail_url", thumbnail_url)):
-        if url and not url.startswith(("http://", "https://")):
-            await interaction.response.send_message(f"`{label}` must be a link starting with http(s)://", ephemeral=True)
-            return False
-    return True
-
-
 async def send_join_leave_message(member: discord.Member, config: dict) -> None:
     text = (
         config["message"]
@@ -497,6 +418,7 @@ async def kick(interaction: discord.Interaction, user: discord.Member, reason: O
     except discord.Forbidden:
         await interaction.response.send_message("I don't have permission to kick that member.", ephemeral=True)
         return
+    log_mod_action(interaction.guild_id, user.id, "kick", reason, interaction.user)
     await interaction.response.send_message(f"Kicked {user.mention}." + (f" Reason: {reason}" if reason else ""))
 
 
@@ -520,6 +442,7 @@ async def ban(interaction: discord.Interaction, user: discord.Member, reason: Op
     except discord.Forbidden:
         await interaction.response.send_message("I don't have permission to ban that member.", ephemeral=True)
         return
+    log_mod_action(interaction.guild_id, user.id, "ban", reason, interaction.user)
     await interaction.response.send_message(f"Banned {user.mention}." + (f" Reason: {reason}" if reason else ""))
 
 
@@ -548,7 +471,32 @@ async def timeout_cmd(
     except discord.Forbidden:
         await interaction.response.send_message("I don't have permission to time out that member.", ephemeral=True)
         return
+    log_mod_action(interaction.guild_id, user.id, "timeout", f"{minutes}m" + (f" — {reason}" if reason else ""), interaction.user)
     await interaction.response.send_message(f"Timed out {user.mention} for {minutes} minute(s).")
+
+
+@client.tree.command(name="untimeout", description="Remove a member's timeout early")
+@app_commands.describe(user="Who to un-timeout")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def untimeout(interaction: discord.Interaction, user: discord.Member):
+    if not user.is_timed_out():
+        await interaction.response.send_message(f"{user.mention} isn't timed out.", ephemeral=True)
+        return
+    try:
+        await user.timeout(None, reason=f"Timeout removed by {interaction.user}")
+    except discord.Forbidden:
+        await interaction.response.send_message("I don't have permission to do that.", ephemeral=True)
+        return
+    log_mod_action(interaction.guild_id, user.id, "untimeout", None, interaction.user)
+    await interaction.response.send_message(f"Removed {user.mention}'s timeout.")
+
+
+@untimeout.error
+async def untimeout_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("You need Timeout Members to do that.", ephemeral=True)
+    else:
+        print(f"/untimeout error: {error}")
 
 
 @timeout_cmd.error
@@ -568,6 +516,7 @@ async def warn(interaction: discord.Interaction, user: discord.Member, reason: s
     warnings_data.setdefault(key, []).append(entry)
     save_json_file(WARNINGS_FILE, warnings_data)
     count = len(warnings_data[key])
+    log_mod_action(interaction.guild_id, user.id, "warn", reason, interaction.user)
     await interaction.response.send_message(f"Warned {user.mention} (warning #{count}). Reason: {reason}")
 
 
@@ -577,6 +526,28 @@ async def warn_error(interaction: discord.Interaction, error: app_commands.AppCo
         await interaction.response.send_message("You need Kick Members to do that.", ephemeral=True)
     else:
         print(f"/warn error: {error}")
+
+
+@client.tree.command(name="clearwarn", description="Remove one of a member's warnings by number")
+@app_commands.describe(user="Whose warning to remove", index="The warning number, from /warnings")
+@app_commands.checks.has_permissions(kick_members=True)
+async def clearwarn(interaction: discord.Interaction, user: discord.Member, index: app_commands.Range[int, 1, 999]):
+    key = pkey(interaction.guild_id, user.id)
+    entries = warnings_data.get(key, [])
+    if index > len(entries):
+        await interaction.response.send_message(f"{user.mention} only has {len(entries)} warning(s).", ephemeral=True)
+        return
+    removed = entries.pop(index - 1)
+    save_json_file(WARNINGS_FILE, warnings_data)
+    await interaction.response.send_message(f"Removed warning #{index} for {user.mention}: {removed['reason']}")
+
+
+@clearwarn.error
+async def clearwarn_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("You need Kick Members to do that.", ephemeral=True)
+    else:
+        print(f"/clearwarn error: {error}")
 
 
 @client.tree.command(name="warnings", description="Show a member's warning history")
@@ -601,6 +572,79 @@ async def warnings_cmd_error(interaction: discord.Interaction, error: app_comman
         print(f"/warnings error: {error}")
 
 
+@client.tree.command(name="modlogs", description="Show a member's full moderation history")
+@app_commands.describe(user="Whose history to show")
+@app_commands.checks.has_permissions(kick_members=True)
+async def modlogs(interaction: discord.Interaction, user: discord.Member):
+    entries = mod_actions.get(pkey(interaction.guild_id, user.id), [])
+    if not entries:
+        await interaction.response.send_message(f"{user.mention} has a clean record.", ephemeral=True)
+        return
+    icons = {"warn": "⚠️", "kick": "👢", "ban": "🔨", "timeout": "🔇", "untimeout": "🔊"}
+    lines = [
+        f"{icons.get(e['type'], '•')} **{e['type']}** — {e['reason']} *(by {e['by']})*"
+        for e in entries[-20:]
+    ]
+    await interaction.response.send_message(
+        f"**Moderation history for {user.mention} ({len(entries)} total):**\n" + "\n".join(lines),
+        ephemeral=True,
+    )
+
+
+@modlogs.error
+async def modlogs_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("You need Kick Members to do that.", ephemeral=True)
+    else:
+        print(f"/modlogs error: {error}")
+
+
+@client.tree.command(name="lockdown", description="Stop everyone except staff from sending messages in a channel")
+@app_commands.describe(channel="Which channel (defaults to this one)")
+@app_commands.checks.has_permissions(manage_channels=True)
+async def lockdown(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
+    target = channel or interaction.channel
+    try:
+        await target.set_permissions(
+            interaction.guild.default_role, send_messages=False, reason=f"Lockdown by {interaction.user}"
+        )
+    except discord.Forbidden:
+        await interaction.response.send_message("I don't have permission to edit that channel.", ephemeral=True)
+        return
+    await interaction.response.send_message(f"🔒 {target.mention} is locked down.")
+
+
+@lockdown.error
+async def lockdown_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("You need Manage Channels to do that.", ephemeral=True)
+    else:
+        print(f"/lockdown error: {error}")
+
+
+@client.tree.command(name="unlock", description="Undo a /lockdown on a channel")
+@app_commands.describe(channel="Which channel (defaults to this one)")
+@app_commands.checks.has_permissions(manage_channels=True)
+async def unlock(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
+    target = channel or interaction.channel
+    try:
+        await target.set_permissions(
+            interaction.guild.default_role, send_messages=None, reason=f"Unlocked by {interaction.user}"
+        )
+    except discord.Forbidden:
+        await interaction.response.send_message("I don't have permission to edit that channel.", ephemeral=True)
+        return
+    await interaction.response.send_message(f"🔓 {target.mention} is unlocked.")
+
+
+@unlock.error
+async def unlock_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("You need Manage Channels to do that.", ephemeral=True)
+    else:
+        print(f"/unlock error: {error}")
+
+
 @client.tree.command(name="unban", description="Unban a user by their ID")
 @app_commands.describe(user_id="The raw user ID to unban")
 @app_commands.checks.has_permissions(ban_members=True)
@@ -618,6 +662,7 @@ async def unban(interaction: discord.Interaction, user_id: str):
     except discord.Forbidden:
         await interaction.response.send_message("I don't have permission to unban.", ephemeral=True)
         return
+    log_mod_action(interaction.guild_id, uid, "unban", None, interaction.user)
     await interaction.response.send_message(f"Unbanned user ID `{uid}`.")
 
 
@@ -834,8 +879,11 @@ async def help_cmd(interaction: discord.Interaction, category: Optional[app_comm
             "a specific role (use `{user}`, `{role}`, `{server}` as placeholders)\n"
             "`/rolemessageoff` *(admin)* — turn that off\n"
             "`/timeout` *(Timeout Members)* — mute a member temporarily\n"
-            "`/warn` and `/warnings` *(Kick Members)* — log and view warnings\n"
+            "`/untimeout` *(Timeout Members)* — lift a timeout early\n"
+            "`/warn`, `/warnings`, `/clearwarn` *(Kick Members)* — log, view, and remove warnings\n"
+            "`/modlogs` *(Kick Members)* — a member's full warn/kick/ban/timeout history in one view\n"
             "`/unban` *(Ban Members)* — unban by raw user ID\n"
+            "`/lockdown` / `/unlock` *(Manage Channels)* — stop/allow everyone sending in a channel\n"
             "`/blockword add/remove/list` *(Manage Messages)* — auto-delete messages with blocked words\n"
             "`/blockinvites` *(Manage Messages)* — toggle auto-deleting Discord invite links",
         ),
@@ -905,7 +953,8 @@ async def commands_cmd(interaction: discord.Interaction):
     embed.add_field(
         name="Moderation",
         value=(
-            "`/purge` `/fullpurge` `/kick` `/ban` `/timeout` `/warn` `/warnings` `/unban` "
+            "`/purge` `/fullpurge` `/kick` `/ban` `/timeout` `/untimeout` `/warn` `/warnings` "
+            "`/clearwarn` `/modlogs` `/unban` `/lockdown` `/unlock` "
             "`/slowmode` `/rolemessage` `/rolemessageoff` `/blockword` `/blockinvites`"
         ),
         inline=False,
