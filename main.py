@@ -2279,3 +2279,4 @@ async def on_ready():
 async def on_message(message: discord.Message):
     if message.author.bot or message.webhook_id:
         return
+        client.run(TOKEN)
