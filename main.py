@@ -144,6 +144,7 @@ def save_role_announce() -> None:
 role_announce_config: dict[int, dict] = load_role_announce()
 
 WARNINGS_FILE = "warnings.json"
+MOD_ACTIONS_FILE = "mod_actions.json"
 BLOCKWORDS_FILE = "blockwords.json"
 BLOCKINVITES_FILE = "blockinvites.json"
 RELAY_BLOCKLIST_FILE = "relay_blocklist.json"
@@ -169,6 +170,20 @@ def save_json_file(path: str, data) -> None:
 
 
 warnings_data: dict = load_json_file(WARNINGS_FILE, {})  # "guild:user" -> [ {reason, by, at}, ... ]
+mod_actions: dict = load_json_file(MOD_ACTIONS_FILE, {})  # "guild:user" -> [ {type, reason, by, at}, ... ]
+
+
+def log_mod_action(guild_id: int, user_id: int, action_type: str, reason: Optional[str], moderator) -> None:
+    key = pkey(guild_id, user_id)
+    mod_actions.setdefault(key, []).append(
+        {
+            "type": action_type,
+            "reason": reason or "No reason given",
+            "by": str(moderator),
+            "at": discord.utils.utcnow().isoformat(),
+        }
+    )
+    save_json_file(MOD_ACTIONS_FILE, mod_actions)
 blockwords: dict = load_json_file(BLOCKWORDS_FILE, {})  # "guild_id" -> [word, ...]
 blockinvites: dict = load_json_file(BLOCKINVITES_FILE, {})  # "guild_id" -> True/False
 relay_blocklist: dict = load_json_file(RELAY_BLOCKLIST_FILE, {})  # "guild_id" -> [channel_id, ...]
@@ -1321,8 +1336,90 @@ async def blockword_remove(interaction: discord.Interaction, word: str):
     await interaction.response.send_message(f"Removed `{w}`.", ephemeral=True)
 
 
-# ---- Loads the rest of the bot (commands/events defined in part2.py) ----
+@blockword_group.command(name="list", description="List blocked words/phrases")
+async def blockword_list(interaction: discord.Interaction):
+    words = blockwords.get(str(interaction.guild_id), [])
+    if not words:
+        await interaction.response.send_message("No words are blocked.", ephemeral=True)
+        return
+    await interaction.response.send_message("Blocked: " + ", ".join(f"`{w}`" for w in words), ephemeral=True)
+
+
+@client.tree.command(name="blockinvites", description="Toggle auto-deleting Discord invite links")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def blockinvites_cmd(interaction: discord.Interaction):
+    key = str(interaction.guild_id)
+    blockinvites[key] = not blockinvites.get(key, False)
+    save_json_file(BLOCKINVITES_FILE, blockinvites)
+    await interaction.response.send_message(
+        "Invite links will now be auto-deleted." if blockinvites[key] else "Invite link filtering turned off.",
+        ephemeral=True,
+    )
+
+
+@client.tree.command(name="starboard", description="Set up the starboard: ⭐-reacted messages get reposted here")
+@app_commands.describe(channel="Where starred messages get reposted", threshold="How many ⭐ reactions needed")
+@app_commands.checks.has_permissions(administrator=True)
+async def starboard_cmd(interaction: discord.Interaction, channel: discord.TextChannel, threshold: app_commands.Range[int, 1, 50] = 3):
+    starboard_config[str(interaction.guild_id)] = {"channel_id": channel.id, "threshold": threshold}
+    save_json_file(STARBOARD_FILE, starboard_config)
+    await interaction.response.send_message(
+        f"Messages with {threshold}+ ⭐ will now be posted to {channel.mention}.", ephemeral=True
+    )
+
+
+@starboard_cmd.error
+async def starboard_cmd_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("You need Administrator to do that.", ephemeral=True)
+    else:
+        print(f"/starboard error: {error}")
+
+
+def build_join_leave_config(
+    channel: discord.TextChannel,
+    message: str,
+    title: Optional[str],
+    color: Optional[str],
+    banner_url: Optional[str],
+    thumbnail_url: Optional[str],
+    use_embed: bool,
+    dm_instead: bool,
+    mention_user: bool,
+) -> dict:
+    return {
+        "channel_id": channel.id,
+        "message": message,
+        "title": title,
+        "color": color,
+        "banner_url": banner_url,
+        "thumbnail_url": thumbnail_url,
+        "use_embed": use_embed,
+        "dm_instead": dm_instead,
+        "mention_user": mention_user,
+    }
+
+
+async def validate_join_leave_inputs(
+    interaction: discord.Interaction, color: Optional[str], banner_url: Optional[str], thumbnail_url: Optional[str]
+) -> bool:
+    if color and not parse_hex_color(color):
+        await interaction.response.send_message(
+            "That doesn't look like a valid hex color. Try something like `#57F287`.", ephemeral=True
+        )
+        return False
+    for label, url in (("banner_url", banner_url), ("thumbnail_url", thumbnail_url)):
+        if url and not url.startswith(("http://", "https://")):
+            await interaction.response.send_message(f"`{label}` must be a link starting with http(s)://", ephemeral=True)
+            return False
+    return True
+
+
+# ---- Loads the rest of the bot (commands/events defined in part2.py and part3.py) ----
 with open(os.path.join(os.path.dirname(__file__), "part2.py"), "r", encoding="utf-8") as _f:
+    exec(_f.read(), globals())
+
+with open(os.path.join(os.path.dirname(__file__), "part3.py"), "r", encoding="utf-8") as _f:
     exec(_f.read(), globals())
 
 client.run(TOKEN)
