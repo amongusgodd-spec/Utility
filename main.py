@@ -2278,4 +2278,4 @@ async def on_ready():
 @client.event
 async def on_message(message: discord.Message):
         {if}  message.author.bot or message.webhook_id:
-        {return}
+        return
